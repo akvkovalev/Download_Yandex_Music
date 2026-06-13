@@ -1,290 +1,265 @@
 import os
-import time
 import json
-import webbrowser
+import time
 from pathlib import Path
-from datetime import datetime
 from yandex_music import Client
-
-class YandexMusicAuth:
-    """Класс для управления авторизацией и токеном"""
-    
-    def __init__(self, token_file="yandex_token.json"):
-        self.token_file = Path(token_file)
-        self.token = None
-        self.client = None
-        
-    def get_token(self):
-        """Получает токен из файла или через Device Flow"""
-        # Пробуем загрузить токен из файла
-        if self.token_file.exists():
-            print(f"🔑 Загрузка токена из файла: {self.token_file}")
-            with open(self.token_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                self.token = data.get('access_token')
-                expires_in = data.get('expires_in', 0)
-                created_at = data.get('created_at', 0)
-                
-                # Проверяем, не истёк ли токен
-                if time.time() - created_at < expires_in:
-                    print(f"✅ Токен действителен (ещё {int((expires_in - (time.time() - created_at)) / 86400)} дней)")
-                    return self.token
-                else:
-                    print("⚠️  Токен истёк, получаем новый...")
-        
-        # Получаем новый токен через Device Flow
-        print("\n🔄 Получение нового токена через Device Flow...")
-        temp_client = Client()
-        
-        def on_code(code):
-            print(f"\n{'='*60}")
-            print(f"🔐 Требуется авторизация в Яндекс Музыке")
-            print(f"{'='*60}")
-            print(f"1️⃣  Откройте ссылку: {code.verification_url}")
-            print(f"2️⃣  Введите код: {code.user_code}")
-            print(f"{'='*60}\n")
-            
-            # Автоматически открываем ссылку в браузере
-            webbrowser.open(code.verification_url)
-        
-        try:
-            # Получаем токен
-            oauth_token = temp_client.device_auth(on_code=on_code)
-            self.token = oauth_token.access_token
-            
-            # Сохраняем токен в файл
-            token_data = {
-                "access_token": self.token,
-                "refresh_token": oauth_token.refresh_token,
-                "expires_in": oauth_token.expires_in,
-                "token_type": oauth_token.token_type,
-                "created_at": time.time()
-            }
-            
-            with open(self.token_file, 'w', encoding='utf-8') as f:
-                json.dump(token_data, f, ensure_ascii=False, indent=2)
-            
-            print(f"\n✅ Токен успешно получен и сохранён в {self.token_file}")
-            print(f"⏱️  Действителен: {oauth_token.expires_in // 86400} дней")
-            
-            return self.token
-            
-        except Exception as e:
-            print(f"❌ Ошибка при получении токена: {e}")
-            print("Попробуйте авторизоваться вручную через браузер")
-            raise
-    
-    def get_client(self):
-        """Возвращает авторизованный клиент"""
-        if not self.token:
-            self.get_token()
-        
-        if not self.client:
-            self.client = Client(self.token).init()
-            print("✅ Клиент инициализирован")
-        
-        return self.client
+from yandex_music.exceptions import YandexMusicError
 
 class YandexMusicSync:
-    """Класс для синхронизации музыки"""
-    
-    def __init__(self, base_dir="yandex_music_library", delay=1, bitrate=320):
+    """
+    Класс для синхронизации плейлистов Яндекс Музыки с локальной файловой системой.
+    """
+
+    def __init__(self, base_dir="yandex_music_library", delay=1, bitrate=320, delete_removed=True):
+        """
+        Инициализация синхронизатора.
+
+        Args:
+            base_dir (str): Корневая папка для хранения музыки.
+            delay (int): Задержка между запросами к API в секундах.
+            bitrate (int): Битрейт для скачивания (64, 192, 320, 0 для FLAC).
+            delete_removed (bool): Удалять ли локальные файлы, если трек удален из плейлиста.
+        """
         self.base_dir = Path(base_dir)
+        self.playlists_dir = self.base_dir / "playlists"
+        self.token_file = self.base_dir / "yandex_token.json"
+        self.metadata_file = self.base_dir / "sync_metadata.json"
+        self.structure_file = self.base_dir / "library_structure.json"
         self.delay = delay
         self.bitrate = bitrate
-        
-        # Авторизация
-        self.auth = YandexMusicAuth()
-        self.client = self.auth.get_client()
-        
-        # Метаданные синхронизации
-        self.metadata_file = self.base_dir / "sync_metadata.json"
-        self.metadata = self.load_metadata()
-        
-    def load_metadata(self):
-        """Загружает метаданные синхронизации"""
-        if self.metadata_file.exists():
-            with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {
-            "last_sync": None,
-            "playlists": {},
-            "downloaded_tracks": {}
-        }
-    
-    def save_metadata(self):
-        """Сохраняет метаданные синхронизации"""
-        self.metadata["last_sync"] = datetime.now().isoformat()
-        with open(self.metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(self.metadata, f, ensure_ascii=False, indent=2)
-    
-    def get_track_id(self, track):
-        """Получает уникальный ID трека"""
-        if hasattr(track, 'track') and track.track:
-            track_obj = track.track
-        else:
-            track_obj = track
-        album_id = track_obj.albums[0].id if track_obj.albums else 0
-        return f"{track_obj.id}_{album_id}"
-    
-    def get_track_filename(self, track_obj):
-        """Формирует безопасное имя файла для трека"""
-        artist_name = track_obj.artists[0].name if track_obj.artists else "Unknown Artist"
-        safe_artist = "".join(c for c in artist_name if c.isalnum() or c in " ._-")
-        safe_title = "".join(c for c in track_obj.title if c.isalnum() or c in " ._-")
-        return f"{safe_artist} - {safe_title}.mp3"
-    
-    def download_track(self, track_obj, filepath):
-        """Скачивает один трек"""
+        self.delete_removed = delete_removed
+        self.token = None
+        self.client = None
+
+        # Создаем необходимые директории
+        self.base_dir.mkdir(exist_ok=True)
+        self.playlists_dir.mkdir(exist_ok=True)
+
+    def get_token(self):
+        """
+        Получает токен авторизации из файла или запрашивает новый.
+        """
+        if self.token_file.exists():
+            try:
+                with open(self.token_file, "r") as f:
+                    token_data = json.load(f)
+                # Проверяем, не истек ли токен (с запасом)
+                if token_data.get("expires_in") - int(time.time()) > 3600:
+                    self.token = token_data["access_token"]
+                    print("🔑 Токен загружен из файла.")
+                    return
+            except (json.JSONDecodeError, KeyError):
+                print("⚠️ Неверный формат токена. Будет запрошен новый.")
+
+        # Запрашиваем новый токен, если файл не найден или токен некорректен
         try:
-            track_obj.download(str(filepath), bitrate_in_kbps=self.bitrate)
-            time.sleep(self.delay)
-            return True
-        except Exception as e:
-            print(f"    ❌ Ошибка: {e}")
-            return False
-    
-    def safe_filename(self, name):
-        """Очищает имя файла/папки от недопустимых символов"""
-        return "".join(c for c in name if c.isalnum() or c in " ._-")
-    
-    def sync_playlist(self, playlist_id, playlist_title):
-        """Синхронизирует один плейлист"""
-        print(f"\n📁 Синхронизация плейлиста: {playlist_title} (ID: {playlist_id})")
-        
-        # Получаем актуальную версию плейлиста
-        playlist = self.client.users_playlists(kind=playlist_id)
-        playlist_dir = self.base_dir / "playlists" / f"{playlist_id}_{self.safe_filename(playlist_title)}"
-        playlist_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Получаем текущие треки в плейлисте из API
-        current_tracks = {}
-        for short_track in playlist.tracks:
-            if hasattr(short_track, 'track') and short_track.track:
-                track_obj = short_track.track
-            else:
-                track_obj = short_track.fetch_track()
+            from yandex_music import Fletch, exceptions
+            fletch = Fletch()
+            # Инструкции для пользователя
+            print(f"Перейдите по ссылке: {fletch.url}")
+            print(f"Введите код: {fletch.code}")
+
+            # Ожидание токена
+            token_data = fletch.get_token()
             
-            track_id = self.get_track_id(short_track)
-            filename = self.get_track_filename(track_obj)
-            current_tracks[track_id] = {
-                "obj": track_obj,
-                "filename": filename,
-                "filepath": playlist_dir / filename
-            }
-        
-        # Получаем сохранённые треки из метаданных
-        saved_tracks = self.metadata["playlists"].get(str(playlist_id), {}).get("tracks", {})
-        
-        # Определяем новые и удалённые треки
-        new_tracks = set(current_tracks.keys()) - set(saved_tracks.keys())
-        removed_tracks = set(saved_tracks.keys()) - set(current_tracks.keys())
-        
-        print(f"  📊 Всего треков: {len(current_tracks)}")
-        print(f"  ➕ Новых: {len(new_tracks)}")
-        print(f"  ➖ Удалённых: {len(removed_tracks)}")
-        
-        # Скачиваем новые треки
-        for track_id in new_tracks:
-            track_info = current_tracks[track_id]
-            print(f"  ⬇️  Скачивание: {track_info['filename']}")
+            with open(self.token_file, "w") as f:
+                json.dump(token_data, f, indent=4)
             
-            if self.download_track(track_info["obj"], track_info["filepath"]):
-                # Обновляем метаданные
-                if track_id not in self.metadata["downloaded_tracks"]:
-                    self.metadata["downloaded_tracks"][track_id] = {
-                        "filename": track_info["filename"],
-                        "playlists": []
-                    }
-                if playlist_id not in self.metadata["downloaded_tracks"][track_id]["playlists"]:
-                    self.metadata["downloaded_tracks"][track_id]["playlists"].append(playlist_id)
+            self.token = token_data["access_token"]
+            print("✅ Новый токен успешно получен и сохранен.")
+
+        except ImportError:
+            raise ImportError("Для получения токена установите `yandex_music[fletch]`")
+        except exceptions.YandexMusicError as e:
+            raise RuntimeError(f"Не удалось получить токен: {e}")
+
+    def init_client(self):
+        """
+        Инициализирует клиент API Яндекс Музыки.
+        """
+        if not self.token:
+            self.get_token()
+            
+            if not self.client:
+                self.client = Client(self.token).init()
+                print("✅ Клиент инициализирован")
+            
+            return self.client
+
+    def load_metadata(self):
+        """
+        Загружает метаданные синхронизации из файла.
+        """
+        if self.metadata_file.exists():
+            with open(self.metadata_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    def save_metadata(self, metadata):
+        """
+        Сохраняет метаданные синхронизации в файл.
+        """
+        with open(self.metadata_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4, ensure_ascii=False)
+
+    def sanitize_filename(self, name):
+        """
+        Очищает имя файла от недопустимых символов.
+        """
+        return "".join(c for c in name if c not in r'<>:"/\|?*')
+
+    def sync_playlist(self, playlist, metadata):
+        """
+        Синхронизирует отдельный плейлист.
+        """
+        playlist_id = f"{playlist.kind}"
+        playlist_title = playlist.title.replace("/", "-")
+        playlist_dir_name = f"{playlist_id}_{self.sanitize_filename(playlist_title)}"
+        playlist_path = self.playlists_dir / playlist_dir_name
+        playlist_path.mkdir(exist_ok=True)
         
-        # Удаляем треки, которых больше нет в плейлисте
-        for track_id in removed_tracks:
-            if track_id in saved_tracks:
-                filepath = playlist_dir / saved_tracks[track_id]
-                if filepath.exists():
-                    filepath.unlink()
-                    print(f"  🗑️  Удалён: {saved_tracks[track_id]}")
-                
-                # Убираем из метаданных плейлиста
-                if track_id in self.metadata["downloaded_tracks"]:
-                    playlists = self.metadata["downloaded_tracks"][track_id]["playlists"]
-                    if playlist_id in playlists:
-                        playlists.remove(playlist_id)
-                    if not playlists:
-                        del self.metadata["downloaded_tracks"][track_id]
+        print(f"🔄 Синхронизация плейлиста: '{playlist_title}'")
         
-        # Обновляем метаданные плейлиста
-        self.metadata["playlists"][str(playlist_id)] = {
-            "title": playlist_title,
-            "revision": playlist.revision,
-            "tracks": {track_id: current_tracks[track_id]["filename"] for track_id in current_tracks.keys()}
-        }
+        try:
+            tracks = playlist.fetch_tracks()
+        except YandexMusicError as e:
+            print(f"   - ❌ Не удалось получить треки: {e}")
+            return
+            
+        online_track_ids = {f"{track.track_id}" for track in tracks}
         
-        return len(new_tracks), len(removed_tracks)
-    
+        # Загружаем метаданные для этого плейлиста
+        playlist_meta = metadata.get(playlist_id, {})
+        local_track_ids = set(playlist_meta.keys())
+        
+        # 1. Удаление треков, которых больше нет в плейлисте
+        if self.delete_removed:
+            tracks_to_delete = local_track_ids - online_track_ids
+            if tracks_to_delete:
+                print(f"   - 🗑️ Найдено {len(tracks_to_delete)} треков для удаления...")
+                for track_id in tracks_to_delete:
+                    track_info = playlist_meta.pop(track_id)
+                    file_path = playlist_path / track_info["filename"]
+                    if file_path.exists():
+                        file_path.unlink()
+                        print(f"     - 🗑️ Удален: {file_path.name}")
+
+        # 2. Скачивание новых треков
+        tracks_to_download = online_track_ids - local_track_ids
+        if tracks_to_download:
+            print(f"   - 📥 Найдено {len(tracks_to_download)} новых треков для скачивания...")
+            for track in tracks:
+                if f"{track.track_id}" in tracks_to_download:
+                    artist = ", ".join(a.name for a in track.artists)
+                    title = track.title
+                    filename = self.sanitize_filename(f"{artist} - {title}.mp3")
+                    file_path = playlist_path / filename
+
+                    if not file_path.exists():
+                        try:
+                            print(f"     - 📥 Скачивание: {filename}")
+                            track.download(file_path, bitrate_in_kbps=self.bitrate)
+                            time.sleep(self.delay)
+                            
+                            # Обновляем метаданные
+                            playlist_meta[f"{track.track_id}"] = {
+                                "filename": filename,
+                                "title": title,
+                                "artist": artist,
+                                "downloaded_at": time.time()
+                            }
+                        except Exception as e:
+                            print(f"       - ❌ Ошибка скачивания: {e}")
+                    else:
+                        print(f"     - ✅ Файл уже существует: {filename}")
+                        # Добавляем в метаданные, даже если файл уже был
+                        playlist_meta[f"{track.track_id}"] = {
+                            "filename": filename,
+                            "title": title,
+                            "artist": artist,
+                            "downloaded_at": playlist_meta.get(f"{track.track_id}", {}).get("downloaded_at", time.time())
+                        }
+
+        if not tracks_to_download and not (self.delete_removed and tracks_to_delete):
+            print("   - ✅ Плейлист в актуальном состоянии.")
+
+        # Обновляем метаданные для этого плейлиста
+        metadata[playlist_id] = playlist_meta
+
+
     def sync_all_playlists(self):
-        """Синхронизирует все плейлисты"""
-        print("=" * 60)
-        print("🔄 НАЧАЛО СИНХРОНИЗАЦИИ YANDEX MUSIC")
-        print("=" * 60)
+        """
+        Синхронизирует все плейлисты пользователя.
+        """
+        self.init_client()
         
-        # Получаем список всех плейлистов
-        print("\n📋 Получение списка плейлистов...")
-        all_playlists = self.client.users_playlists_list()
-        print(f"✅ Найдено плейлистов: {len(all_playlists)}")
-        
-        total_new = 0
-        total_removed = 0
-        
-        # Синхронизируем каждый плейлист
-        for i, playlist in enumerate(all_playlists, 1):
-            print(f"\n[{i}/{len(all_playlists)}]")
-            new, removed = self.sync_playlist(playlist.kind, playlist.title)
-            total_new += new
-            total_removed += removed
-        
-        # Сохраняем метаданные
-        self.save_metadata()
-        
-        # Выводим итоги
-        print("\n" + "=" * 60)
-        print("📊 ИТОГИ СИНХРОНИЗАЦИИ")
-        print("=" * 60)
-        print(f"📁 Базовая папка: {self.base_dir.absolute()}")
-        print(f"📦 Плейлистов обработано: {len(all_playlists)}")
-        print(f"➕ Скачано новых треков: {total_new}")
-        print(f"➖ Удалено треков: {total_removed}")
-        print(f"🎵 Всего уникальных треков в библиотеке: {len(self.metadata['downloaded_tracks'])}")
-        print(f"🕐 Последняя синхронизация: {self.metadata['last_sync']}")
-        print("=" * 60)
-    
+        print("Получение списка плейлистов...")
+        try:
+            playlists = self.client.users_playlists_list()
+            # Добавляем "Мне нравится"
+            liked_tracks_playlist = self.client.users_likes_tracks()
+            playlists.insert(0, liked_tracks_playlist)
+            print(f"✅ Найдено {len(playlists)} плейлистов (включая 'Мне нравится').")
+            
+        except YandexMusicError as e:
+            print(f"❌ Не удалось получить плейлисты: {e}")
+            return
+
+        metadata = self.load_metadata()
+
+        for playlist in playlists:
+            self.sync_playlist(playlist, metadata)
+            # Сохраняем прогресс после каждого плейлиста
+            self.save_metadata(metadata)
+            print("-" * 20)
+            
+        # Финальное сохранение
+        self.save_metadata(metadata)
+
+
     def export_library_structure(self):
-        """Экспортирует структуру библиотеки в JSON"""
-        structure = {
-            "base_directory": str(self.base_dir.absolute()),
-            "bitrate": self.bitrate,
-            "sync_metadata": self.metadata,
-            "directory_tree": []
-        }
+        """
+        Экспортирует структуру библиотеки в JSON-файл.
+        """
+        library_structure = {"playlists": []}
         
-        # Строим дерево директорий
-        for playlist_id, playlist_data in self.metadata["playlists"].items():
-            playlist_path = self.base_dir / "playlists" / f"{playlist_id}_{self.safe_filename(playlist_data['title'])}"
-            structure["directory_tree"].append({
-                "playlist_id": int(playlist_id),
-                "title": playlist_data["title"],
-                "path": str(playlist_path.relative_to(self.base_dir) if playlist_path.exists() else None),
-                "tracks": list(playlist_data["tracks"].values())
-            })
+        metadata = self.load_metadata()
         
-        export_file = self.base_dir / "library_structure.json"
-        with open(export_file, 'w', encoding='utf-8') as f:
-            json.dump(structure, f, ensure_ascii=False, indent=2)
+        try:
+            playlists = self.client.users_playlists_list()
+            playlists.insert(0, self.client.users_likes_tracks())
+        except Exception:
+            # Если нет клиента, используем только метаданные
+            playlists = []
+
+        playlist_map = {f"{pl.kind}": pl.title for pl in playlists}
+
+        for playlist_id, track_data in metadata.items():
+            playlist_title = playlist_map.get(playlist_id, f"Неизвестный плейлист (ID: {playlist_id})")
+            
+            playlist_info = {
+                "id": playlist_id,
+                "title": playlist_title,
+                "path": str(self.playlists_dir / f"{playlist_id}_{self.sanitize_filename(playlist_title)}"),
+                "tracks_count": len(track_data),
+                "tracks": []
+            }
+
+            for track_id, track_details in track_data.items():
+                playlist_info["tracks"].append({
+                    "id": track_id,
+                    "filename": track_details["filename"],
+                    "title": track_details["title"],
+                    "artist": track_details["artist"]
+                })
+            
+            library_structure["playlists"].append(playlist_info)
+            
+        with open(self.structure_file, "w", encoding="utf-8") as f:
+            json.dump(library_structure, f, indent=4, ensure_ascii=False)
         
-        print(f"\n📄 Структура библиотеки экспортирована в: {export_file}")
-        return structure
+        print(f"📊 Структура библиотеки экспортирована в {self.structure_file}")
+
 
 # Запуск синхронизации
 if __name__ == "__main__":
@@ -294,7 +269,8 @@ if __name__ == "__main__":
         sync = YandexMusicSync(
             base_dir="yandex_music_library",
             delay=1,
-            bitrate=320  # Можно изменить на 192 или 0 для lossless
+            bitrate=320,  # Можно изменить на 192 или 0 для lossless
+            delete_removed=True # Измените на False, чтобы не удалять треки
         )
         
         # Синхронизируем все плейлисты
